@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="Resources/aura_tag_icon.png" width="128" height="128" alt="FileID Logo">
+  <img src="Resources/file_id_icon.png" width="128" height="128" alt="FileID Logo">
 </p>
 
 # 📂 FileID

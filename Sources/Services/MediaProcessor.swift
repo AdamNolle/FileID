@@ -311,53 +311,92 @@ actor MediaProcessor {
 
     func preparePreviewNames() async {
         let context = ModelContext(container)
-        var descriptor = FetchDescriptor<FileRecord>(
-            predicate: #Predicate { $0.statusValue == "namingRequired" },
-            sortBy: [SortDescriptor(\.creationDate)]
-        )
-        descriptor.fetchLimit = 5000
-        guard let files = try? context.fetch(descriptor) else { return }
+        let limit = 500
 
-        for file in files {
-            let newName = generateFilename(original: file.filename, tags: file.aiTags)
-            file.proposedFilename = newName
-            file.status = .reviewRequired
+        while true {
+            var descriptor = FetchDescriptor<FileRecord>(
+                predicate: #Predicate { $0.statusValue == "namingRequired" },
+                sortBy: [SortDescriptor(\.creationDate)]
+            )
+            descriptor.fetchLimit = limit
+            // DO NOT use offset here because the predicate results will shrink as we process them.
+            // When we change statusValue to .reviewRequired, they no longer match the predicate.
+
+            guard let files = try? context.fetch(descriptor), !files.isEmpty else { break }
+
+            for file in files {
+                let newName = generateFilename(original: file.filename, tags: file.aiTags)
+                file.proposedFilename = newName
+                file.status = .reviewRequired
+            }
+            try? context.save()
+            // To prevent context from growing too large over 50,000 files:
+            context.reset()
         }
-        try? context.save()
+
         await runDuplicateDetection(context: context)
     }
 
     private func runDuplicateDetection(context: ModelContext) async {
-        var descriptor = FetchDescriptor<FileRecord>(sortBy: [SortDescriptor(\.creationDate)])
-        descriptor.propertiesToFetch = [\.id, \.scenePrintData, \.creationDate]
-        guard let files = try? context.fetch(descriptor) else { return }
-
-        let window = 20
+        // Enumerate in batches to avoid OOM on 50k items
+        let fetchLimit = 500
+        var offset = 0
+        var allProcessed = false
         var groups: [UUID: UUID] = [:]  // fileID → groupID
+        let window = 20
 
-        for i in 0..<files.count {
-            guard let dataA = files[i].scenePrintData,
-                  let printA = try? NSKeyedUnarchiver.unarchivedObject(ofClass: VNFeaturePrintObservation.self, from: dataA)
-            else { continue }
+        while !allProcessed {
+            var descriptor = FetchDescriptor<FileRecord>(sortBy: [SortDescriptor(\.creationDate)])
+            descriptor.propertiesToFetch = [\.id, \.scenePrintData, \.creationDate]
 
-            for j in (i+1)..<min(i+window, files.count) {
-                guard let dataB = files[j].scenePrintData,
-                      let printB = try? NSKeyedUnarchiver.unarchivedObject(ofClass: VNFeaturePrintObservation.self, from: dataB)
+            // To maintain the window overlap correctly across boundary fetches without keeping
+            // invalidated references across context.reset(), we fetch overlap directly from the database:
+            let fetchOffset = max(0, offset - window)
+            let actualLimit = offset == 0 ? fetchLimit : fetchLimit + window
+
+            descriptor.fetchLimit = actualLimit
+            descriptor.fetchOffset = fetchOffset
+
+            guard let files = try? context.fetch(descriptor), !files.isEmpty else {
+                allProcessed = true
+                continue
+            }
+
+            for i in 0..<files.count {
+                guard let dataA = files[i].scenePrintData,
+                      let printA = try? NSKeyedUnarchiver.unarchivedObject(ofClass: VNFeaturePrintObservation.self, from: dataA)
                 else { continue }
-                var dist: Float = 0
-                try? printA.computeDistance(&dist, to: printB)
-                if dist < 10.0 {
-                    let gid = groups[files[i].id] ?? UUID()
-                    groups[files[i].id] = gid
-                    groups[files[j].id] = gid
+
+                for j in (i+1)..<min(i+window, files.count) {
+                    guard let dataB = files[j].scenePrintData,
+                          let printB = try? NSKeyedUnarchiver.unarchivedObject(ofClass: VNFeaturePrintObservation.self, from: dataB)
+                    else { continue }
+                    var dist: Float = 0
+                    try? printA.computeDistance(&dist, to: printB)
+                    if dist < 10.0 {
+                        let gid = groups[files[i].id] ?? UUID()
+                        groups[files[i].id] = gid
+                        groups[files[j].id] = gid
+                    }
+                }
+
+                if let gid = groups[files[i].id] {
+                    files[i].duplicateGroupUUID = gid
                 }
             }
-        }
+            try? context.save()
 
-        for file in files {
-            if let gid = groups[file.id] { file.duplicateGroupUUID = gid }
+            // Clear context to prevent OOM
+            context.reset()
+
+            // If we fetched fewer items than limit + window (or just limit if offset 0),
+            // we have reached the end of the records
+            if files.count < actualLimit {
+                allProcessed = true
+            } else {
+                offset += fetchLimit
+            }
         }
-        try? context.save()
     }
 
     func applyIdentityNames(folderURL: URL) async {
@@ -417,27 +456,40 @@ actor MediaProcessor {
 
     func applyFolderStructure(root: URL) async {
         let context = ModelContext(container)
-        let descriptor = FetchDescriptor<FileRecord>(predicate: #Predicate {
-            $0.statusValue == "completed" || $0.statusValue == "reviewRequired"
-        })
-        guard let files = try? context.fetch(descriptor) else { return }
-
+        var offset = 0
+        let limit = 500
         var moved = 0
-        for file in files {
-            let cat = fileIDCategory(for: file)  // nonisolated helper — avoids @MainActor call
-            let cal = Calendar.current
-            let yr  = cal.component(.year,  from: file.creationDate)
-            let mo  = String(format: "%02d", cal.component(.month, from: file.creationDate))
-            let dst = root.appendingPathComponent("\(yr)/\(mo)/\(cat)/\(file.url.lastPathComponent)")
-            guard file.url != dst else { continue }
-            do {
-                try FileManager.default.createDirectory(at: dst.deletingLastPathComponent(), withIntermediateDirectories: true)
-                try FileManager.default.moveItem(at: file.url, to: dst)
-                file.url = dst; file.filename = dst.lastPathComponent
-                moved += 1
-            } catch { await viewModel.log("Move failed: \(error.localizedDescription)") }
+
+        while true {
+            var descriptor = FetchDescriptor<FileRecord>(
+                predicate: #Predicate {
+                    $0.statusValue == "completed" || $0.statusValue == "reviewRequired"
+                },
+                sortBy: [SortDescriptor(\.creationDate)]
+            )
+            descriptor.fetchLimit = limit
+            descriptor.fetchOffset = offset
+            guard let files = try? context.fetch(descriptor), !files.isEmpty else { break }
+
+            for file in files {
+                let cat = fileIDCategory(for: file)  // nonisolated helper — avoids @MainActor call
+                let cal = Calendar.current
+                let yr  = cal.component(.year,  from: file.creationDate)
+                let mo  = String(format: "%02d", cal.component(.month, from: file.creationDate))
+                let dst = root.appendingPathComponent("\(yr)/\(mo)/\(cat)/\(file.url.lastPathComponent)")
+                guard file.url != dst else { continue }
+                do {
+                    try FileManager.default.createDirectory(at: dst.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    try FileManager.default.moveItem(at: file.url, to: dst)
+                    file.url = dst; file.filename = dst.lastPathComponent
+                    moved += 1
+                } catch { await viewModel.log("Move failed: \(error.localizedDescription)") }
+            }
+            try? context.save()
+            context.reset()
+            offset += limit
         }
-        try? context.save()
+
         let movedCount = moved
         await viewModel.log("Moved \(movedCount) files.")
     }
