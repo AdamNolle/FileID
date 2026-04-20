@@ -352,8 +352,11 @@ class AppViewModel: ObservableObject {
         guard currentCount != lastTreeCount else { return }
         lastTreeCount = currentCount
 
-        // Lightweight folder-level query — don't hydrate file data
-        guard let files = try? context.fetch(FetchDescriptor<FileRecord>()) else { return }
+        // Lightweight folder-level query — avoid hydrating large files into memory
+        var descriptor = FetchDescriptor<FileRecord>()
+        descriptor.propertiesToFetch = [\.url, \.statusValue]
+
+        guard let files = try? context.fetch(descriptor) else { return }
 
         class Node {
             var name: String; var path: String

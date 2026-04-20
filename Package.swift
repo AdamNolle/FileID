@@ -11,7 +11,7 @@ let package = Package(
             name: "FileID",
             path: "Sources",
             resources: [
-                .copy("../Resources/aura_tag_icon.png")
+                .copy("../Resources/file_id_icon.png")
             ]
         )
     ]
